@@ -1,9 +1,12 @@
 import argparse
+import csv
 import gzip
 import os
 import struct
 import urllib.request
+from datetime import datetime
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -121,6 +124,8 @@ def main():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--run-name", type=str, default="")
+    p.add_argument("--figures-dir", type=str, default="figures")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -164,6 +169,7 @@ def main():
     loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     best_acc = 0.0
+    history = []
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -181,12 +187,60 @@ def main():
         train_loss = running_loss / len(train_loader.dataset)
         acc = evaluate(model, test_loader, device)
         best_acc = max(best_acc, acc)
+        lr_now = scheduler.get_last_lr()[0]
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "test_acc": acc,
+            "best_acc": best_acc,
+            "lr": lr_now,
+        })
         print(
             f"epoch={epoch} train_loss={train_loss:.4f} test_acc={acc:.4f} "
-            f"best_acc={best_acc:.4f} lr={scheduler.get_last_lr()[0]:.6f}"
+            f"best_acc={best_acc:.4f} lr={lr_now:.6f}"
         )
 
     print(f"FINAL_BEST_ACC={best_acc:.4f}")
+
+    os.makedirs(args.figures_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = args.run_name if args.run_name else f"mnist_lut_{stamp}"
+
+    csv_path = os.path.join(args.figures_dir, f"{run_name}_metrics.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "test_acc", "best_acc", "lr"])
+        w.writeheader()
+        w.writerows(history)
+
+    epochs = [h["epoch"] for h in history]
+    train_loss_vals = [h["train_loss"] for h in history]
+    test_acc_vals = [h["test_acc"] for h in history]
+    lr_vals = [h["lr"] for h in history]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].plot(epochs, train_loss_vals, marker="o")
+    axes[0].set_title("Train Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+
+    axes[1].plot(epochs, test_acc_vals, marker="o")
+    axes[1].set_title("Test Accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+
+    axes[2].plot(epochs, lr_vals, marker="o")
+    axes[2].set_title("Learning Rate")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylabel("LR")
+
+    fig.suptitle(f"{run_name} (best_acc={best_acc:.4f})")
+    fig.tight_layout()
+    plot_path = os.path.join(args.figures_dir, f"{run_name}_curves.png")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+
+    print(f"METRICS_CSV={csv_path}")
+    print(f"CURVES_PNG={plot_path}")
 
 
 if __name__ == "__main__":
