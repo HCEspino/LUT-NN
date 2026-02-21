@@ -19,20 +19,24 @@ class _LUTTransformFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, table, anchors_a, anchors_b, bit_powers):
+    def forward(ctx, x, table, anchors_a, anchors_b, bit_powers, surrogate_topk):
         # x: [B, I], table: [T, R, O]
         bsz, _ = x.shape
         num_tables, _, out_features = table.shape
         num_comp = anchors_a.shape[1]
+        k = int(surrogate_topk)
+        if k < 1:
+            raise ValueError("surrogate_topk must be >= 1")
+        k = min(k, num_comp)
 
         y = x.new_zeros(bsz, out_features)
 
         # Cached tensors for backward
         idx_all = torch.empty((num_tables, bsz), dtype=torch.long, device=x.device)
-        flip_idx_all = torch.empty((num_tables, bsz), dtype=torch.long, device=x.device)
-        min_u_all = torch.empty((num_tables, bsz), dtype=x.dtype, device=x.device)
-        min_a_all = torch.empty((num_tables, bsz), dtype=torch.long, device=x.device)
-        min_b_all = torch.empty((num_tables, bsz), dtype=torch.long, device=x.device)
+        topk_flip_idx_all = torch.empty((num_tables, bsz, k), dtype=torch.long, device=x.device)
+        topk_u_all = torch.empty((num_tables, bsz, k), dtype=x.dtype, device=x.device)
+        topk_a_all = torch.empty((num_tables, bsz, k), dtype=torch.long, device=x.device)
+        topk_b_all = torch.empty((num_tables, bsz, k), dtype=torch.long, device=x.device)
 
         for i in range(num_tables):
             a = anchors_a[i]  # [C]
@@ -44,61 +48,62 @@ class _LUTTransformFn(torch.autograd.Function):
             y = y + table[i, idx, :]  # Eq. (3)
 
             abs_diffs = diffs.abs()
-            min_r = abs_diffs.argmin(dim=1)  # [B]
-            min_u = diffs.gather(1, min_r.unsqueeze(1)).squeeze(1)  # [B]
+            topk_r = abs_diffs.topk(k, dim=1, largest=False).indices  # [B, K]
+            topk_u = diffs.gather(1, topk_r)  # [B, K]
 
-            flip_bit = (1 << min_r).long()  # [B]
-            flip_idx = idx ^ flip_bit
+            flip_bit = (1 << topk_r).long()  # [B, K]
+            topk_flip_idx = idx.unsqueeze(1) ^ flip_bit  # [B, K]
 
-            min_a = a[min_r]  # [B]
-            min_b = b[min_r]  # [B]
+            topk_a = a[topk_r]  # [B, K]
+            topk_b = b[topk_r]  # [B, K]
 
             idx_all[i] = idx
-            flip_idx_all[i] = flip_idx
-            min_u_all[i] = min_u
-            min_a_all[i] = min_a
-            min_b_all[i] = min_b
+            topk_flip_idx_all[i] = topk_flip_idx
+            topk_u_all[i] = topk_u
+            topk_a_all[i] = topk_a
+            topk_b_all[i] = topk_b
 
-        ctx.save_for_backward(x, table, idx_all, flip_idx_all, min_u_all, min_a_all, min_b_all)
+        ctx.save_for_backward(x, table, idx_all, topk_flip_idx_all, topk_u_all, topk_a_all, topk_b_all)
         return y
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, table, idx_all, flip_idx_all, min_u_all, min_a_all, min_b_all = ctx.saved_tensors
+        x, table, idx_all, topk_flip_idx_all, topk_u_all, topk_a_all, topk_b_all = ctx.saved_tensors
 
         bsz, in_features = x.shape
         num_tables = table.shape[0]
+        k = topk_flip_idx_all.shape[2]
 
         grad_x = torch.zeros_like(x)
         grad_table = torch.zeros_like(table)
 
         # U'(u) for U(u)=0.5/(1+|u|)
         # d/du [0.5/(1+|u|)] = -0.5*sign(u)/(1+|u|)^2
-        u_prime = -0.5 * torch.sign(min_u_all) / (1.0 + min_u_all.abs()).pow(2)  # [T, B]
+        u_prime = -0.5 * torch.sign(topk_u_all) / (1.0 + topk_u_all.abs()).pow(2)  # [T, B, K]
 
         for i in range(num_tables):
-            idx = idx_all[i]          # [B]
-            flip_idx = flip_idx_all[i]  # [B]
+            idx = idx_all[i]  # [B]
+            s_cur = table[i, idx, :]  # [B, O]
 
-            s_cur = table[i, idx, :]       # [B, O]
-            s_flip = table[i, flip_idx, :] # [B, O]
+            for kk in range(k):
+                flip_idx = topk_flip_idx_all[i, :, kk]  # [B]
+                s_flip = table[i, flip_idx, :]  # [B, O]
 
-            # Eq. (7): g_i = dL/dy · (S_flip - S_cur)
-            g_i = (grad_output * (s_flip - s_cur)).sum(dim=1)  # [B]
+                # Eq. (7): g_i = dL/dy · (S_flip - S_cur)
+                g_i = (grad_output * (s_flip - s_cur)).sum(dim=1)  # [B]
 
-            coeff = u_prime[i] * g_i  # [B]
+                coeff = u_prime[i, :, kk] * g_i  # [B]
 
-            a_idx = min_a_all[i]
-            b_idx = min_b_all[i]
+                a_idx = topk_a_all[i, :, kk]
+                b_idx = topk_b_all[i, :, kk]
 
-            # Eq. (8): +/- U'(u_i) * g_i on the minimal pair coordinates
-            grad_x.scatter_add_(1, a_idx.unsqueeze(1), coeff.unsqueeze(1))
-            grad_x.scatter_add_(1, b_idx.unsqueeze(1), (-coeff).unsqueeze(1))
+                grad_x.scatter_add_(1, a_idx.unsqueeze(1), coeff.unsqueeze(1))
+                grad_x.scatter_add_(1, b_idx.unsqueeze(1), (-coeff).unsqueeze(1))
 
             # Paper pseudocode line 29: update selected row by v^{l+1}
             grad_table[i].index_add_(0, idx, grad_output)
 
-        return grad_x, grad_table, None, None, None
+        return grad_x, grad_table, None, None, None, None
 
 
 class LUTBlock(nn.Module):
@@ -120,6 +125,7 @@ class LUTBlock(nn.Module):
         residual: bool = False,
         table_init_std: float = 0.02,
         seed: int | None = None,
+        surrogate_topk: int = 1,
     ):
         super().__init__()
         if num_comparisons <= 0:
@@ -133,6 +139,7 @@ class LUTBlock(nn.Module):
         self.num_comparisons = num_comparisons
         self.num_rows = 2 ** num_comparisons
         self.residual = residual and (in_features == out_features)
+        self.surrogate_topk = max(1, min(int(surrogate_topk), num_comparisons))
 
         g = torch.Generator()
         if seed is not None:
@@ -170,6 +177,7 @@ class LUTBlock(nn.Module):
             self.anchors_a,
             self.anchors_b,
             self.bit_powers,
+            self.surrogate_topk,
         )
 
         if self.residual:
