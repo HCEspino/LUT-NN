@@ -35,6 +35,7 @@ class _LUTTransformFn(torch.autograd.Function):
         idx_all = torch.empty((num_tables, bsz), dtype=torch.long, device=x.device)
         topk_flip_idx_all = torch.empty((num_tables, bsz, k), dtype=torch.long, device=x.device)
         topk_u_all = torch.empty((num_tables, bsz, k), dtype=x.dtype, device=x.device)
+        topk_abs_all = torch.empty((num_tables, bsz, k), dtype=x.dtype, device=x.device)
         topk_a_all = torch.empty((num_tables, bsz, k), dtype=torch.long, device=x.device)
         topk_b_all = torch.empty((num_tables, bsz, k), dtype=torch.long, device=x.device)
 
@@ -50,6 +51,7 @@ class _LUTTransformFn(torch.autograd.Function):
             abs_diffs = diffs.abs()
             topk_r = abs_diffs.topk(k, dim=1, largest=False).indices  # [B, K]
             topk_u = diffs.gather(1, topk_r)  # [B, K]
+            topk_abs = abs_diffs.gather(1, topk_r)  # [B, K]
 
             flip_bit = (1 << topk_r).long()  # [B, K]
             topk_flip_idx = idx.unsqueeze(1) ^ flip_bit  # [B, K]
@@ -60,15 +62,16 @@ class _LUTTransformFn(torch.autograd.Function):
             idx_all[i] = idx
             topk_flip_idx_all[i] = topk_flip_idx
             topk_u_all[i] = topk_u
+            topk_abs_all[i] = topk_abs
             topk_a_all[i] = topk_a
             topk_b_all[i] = topk_b
 
-        ctx.save_for_backward(x, table, idx_all, topk_flip_idx_all, topk_u_all, topk_a_all, topk_b_all)
+        ctx.save_for_backward(x, table, idx_all, topk_flip_idx_all, topk_u_all, topk_abs_all, topk_a_all, topk_b_all)
         return y
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, table, idx_all, topk_flip_idx_all, topk_u_all, topk_a_all, topk_b_all = ctx.saved_tensors
+        x, table, idx_all, topk_flip_idx_all, topk_u_all, topk_abs_all, topk_a_all, topk_b_all = ctx.saved_tensors
 
         bsz, in_features = x.shape
         num_tables = table.shape[0]
@@ -85,20 +88,30 @@ class _LUTTransformFn(torch.autograd.Function):
             idx = idx_all[i]  # [B]
             s_cur = table[i, idx, :]  # [B, O]
 
-            for kk in range(k):
-                flip_idx = topk_flip_idx_all[i, :, kk]  # [B]
-                s_flip = table[i, flip_idx, :]  # [B, O]
+            flip_idx = topk_flip_idx_all[i]  # [B, K]
+            s_flip = table[i, flip_idx, :]  # [B, K, O]
 
-                # Eq. (7): g_i = dL/dy · (S_flip - S_cur)
-                g_i = (grad_output * (s_flip - s_cur)).sum(dim=1)  # [B]
+            # Eq. (7) generalized over top-k flips per table.
+            # g_i[b, k] = dL/dy[b] · (S_flip[b, k] - S_cur[b])
+            g_i = (grad_output.unsqueeze(1) * (s_flip - s_cur.unsqueeze(1))).sum(dim=2)  # [B, K]
 
-                coeff = u_prime[i, :, kk] * g_i  # [B]
+            # Proximity weighting: closer-to-boundary pairs get more signal.
+            weight = 1.0 / (1.0 + topk_abs_all[i])  # [B, K]
+            weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-                a_idx = topk_a_all[i, :, kk]
-                b_idx = topk_b_all[i, :, kk]
+            coeff = u_prime[i] * g_i * weight  # [B, K]
 
-                grad_x.scatter_add_(1, a_idx.unsqueeze(1), coeff.unsqueeze(1))
-                grad_x.scatter_add_(1, b_idx.unsqueeze(1), (-coeff).unsqueeze(1))
+            a_idx = topk_a_all[i]  # [B, K]
+            b_idx = topk_b_all[i]  # [B, K]
+
+            # Flatten K into batch dimension for efficient indexed accumulation.
+            coeff_flat = coeff.reshape(-1)  # [B*K]
+            a_flat = a_idx.reshape(-1)  # [B*K]
+            b_flat = b_idx.reshape(-1)  # [B*K]
+            batch_idx = torch.arange(bsz, device=x.device).unsqueeze(1).expand(-1, k).reshape(-1)
+
+            grad_x.index_put_((batch_idx, a_flat), coeff_flat, accumulate=True)
+            grad_x.index_put_((batch_idx, b_flat), -coeff_flat, accumulate=True)
 
             # Paper pseudocode line 29: update selected row by v^{l+1}
             grad_table[i].index_add_(0, idx, grad_output)
