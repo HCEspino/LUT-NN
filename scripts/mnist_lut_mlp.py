@@ -61,26 +61,31 @@ def load_mnist(root: str = "./data/mnist"):
 class MLPWithLUT(nn.Module):
     def __init__(
         self,
-        hidden_dim: int = 128,
-        lut_out: int = 128,
+        hidden_dim: int = 256,
         num_tables: int = 8,
         num_comparisons: int = 6,
+        num_blocks: int = 1,
+        dropout: float = 0.0,
     ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(28 * 28, hidden_dim),
-            nn.ReLU(),
-            LUTBlock(
-                in_features=hidden_dim,
-                out_features=lut_out,
-                num_tables=num_tables,
-                num_comparisons=num_comparisons,
-                residual=(hidden_dim == lut_out),
-            ),
-            nn.ReLU(),
-            nn.Linear(lut_out, 10),
-        )
+        layers = [nn.Flatten(), nn.Linear(28 * 28, hidden_dim), nn.ReLU()]
+
+        for _ in range(num_blocks):
+            layers.append(
+                LUTBlock(
+                    in_features=hidden_dim,
+                    out_features=hidden_dim,
+                    num_tables=num_tables,
+                    num_comparisons=num_comparisons,
+                    residual=True,
+                )
+            )
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+
+        layers.append(nn.Linear(hidden_dim, 10))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
@@ -101,15 +106,19 @@ def evaluate(model, loader, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--train-limit", type=int, default=10000)
-    p.add_argument("--test-limit", type=int, default=2000)
-    p.add_argument("--hidden", type=int, default=128)
-    p.add_argument("--lut-out", type=int, default=128)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adagrad", "rmsprop"])
+    p.add_argument("--train-limit", type=int, default=20000)
+    p.add_argument("--test-limit", type=int, default=5000)
+    p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--num-tables", type=int, default=8)
     p.add_argument("--num-comparisons", type=int, default=6)
+    p.add_argument("--num-blocks", type=int, default=2)
+    p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     args = p.parse_args()
@@ -138,14 +147,23 @@ def main():
 
     model = MLPWithLUT(
         hidden_dim=args.hidden,
-        lut_out=args.lut_out,
         num_tables=args.num_tables,
         num_comparisons=args.num_comparisons,
+        num_blocks=args.num_blocks,
+        dropout=args.dropout,
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    loss_fn = nn.CrossEntropyLoss()
+    if args.optimizer == "adamw":
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == "adagrad":
+        opt = torch.optim.Adagrad(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.RMSprop(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, alpha=0.99)
 
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs, 1))
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    best_acc = 0.0
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -155,12 +173,20 @@ def main():
             logits = model(x)
             loss = loss_fn(logits, y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             running_loss += loss.item() * y.size(0)
 
+        scheduler.step()
         train_loss = running_loss / len(train_loader.dataset)
         acc = evaluate(model, test_loader, device)
-        print(f"epoch={epoch} train_loss={train_loss:.4f} test_acc={acc:.4f}")
+        best_acc = max(best_acc, acc)
+        print(
+            f"epoch={epoch} train_loss={train_loss:.4f} test_acc={acc:.4f} "
+            f"best_acc={best_acc:.4f} lr={scheduler.get_last_lr()[0]:.6f}"
+        )
+
+    print(f"FINAL_BEST_ACC={best_acc:.4f}")
 
 
 if __name__ == "__main__":
