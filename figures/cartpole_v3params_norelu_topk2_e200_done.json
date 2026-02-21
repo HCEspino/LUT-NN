@@ -1,0 +1,14 @@
+{
+  "run_name": "cartpole_v3params_norelu_topk2_e200",
+  "status": "completed",
+  "device": "cuda",
+  "algo": "dqn",
+  "episodes": 200,
+  "final_avg100": 92.65,
+  "best_reward": 368.0,
+  "solved_episode": null,
+  "summary_txt": "figures/cartpole_v3params_norelu_topk2_e200_summary.txt",
+  "metrics_csv": "figures/cartpole_v3params_norelu_topk2_e200_metrics.csv",
+  "curves_png": "figures/cartpole_v3params_norelu_topk2_e200_curves.png",
+  "finished_at": "2026-02-21T08:13:19.395993"
+}
