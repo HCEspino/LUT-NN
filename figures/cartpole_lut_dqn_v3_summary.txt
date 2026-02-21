@@ -1,0 +1,11 @@
+run_name=cartpole_lut_dqn_v3
+env=CartPole-v1
+episodes=350
+first_reward=9.0
+last_reward=69.0
+final_avg100=75.3200
+best_reward=431.0
+first_gif=figures/cartpole_lut_dqn_v3_first_session.gif
+last_gif=figures/cartpole_lut_dqn_v3_last_session.gif
+metrics_csv=figures/cartpole_lut_dqn_v3_metrics.csv
+curves_png=figures/cartpole_lut_dqn_v3_curves.png
