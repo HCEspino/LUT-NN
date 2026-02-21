@@ -65,8 +65,6 @@ class MLPWithLUT(nn.Module):
         lut_out: int = 128,
         num_tables: int = 8,
         num_comparisons: int = 6,
-        tau: float = 0.5,
-        routing_sharpness: float = 12.0,
     ):
         super().__init__()
         self.net = nn.Sequential(
@@ -78,8 +76,6 @@ class MLPWithLUT(nn.Module):
                 out_features=lut_out,
                 num_tables=num_tables,
                 num_comparisons=num_comparisons,
-                tau=tau,
-                routing_sharpness=routing_sharpness,
                 residual=(hidden_dim == lut_out),
             ),
             nn.ReLU(),
@@ -114,8 +110,6 @@ def main():
     p.add_argument("--lut-out", type=int, default=128)
     p.add_argument("--num-tables", type=int, default=8)
     p.add_argument("--num-comparisons", type=int, default=6)
-    p.add_argument("--tau", type=float, default=0.5)
-    p.add_argument("--routing-sharpness", type=float, default=12.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     args = p.parse_args()
@@ -147,8 +141,6 @@ def main():
         lut_out=args.lut_out,
         num_tables=args.num_tables,
         num_comparisons=args.num_comparisons,
-        tau=args.tau,
-        routing_sharpness=args.routing_sharpness,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
