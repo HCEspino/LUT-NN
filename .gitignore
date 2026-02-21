@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Artifacts
+runs/
+checkpoints/
+data/
+*.pt
+*.pth
+
+# Local notes / planning
+REPO_MEMORY.md
+PLAN.md
+*_MEMORY.md
+*_PLAN.md
