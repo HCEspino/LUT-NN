@@ -1,10 +1,61 @@
 import argparse
+import gzip
+import os
+import struct
+import urllib.request
+
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, TensorDataset
 
 from lut_nn import LUTBlock
+
+
+MNIST_URL_BASE = "https://storage.googleapis.com/cvdf-datasets/mnist"
+MNIST_FILES = {
+    "train_images": "train-images-idx3-ubyte.gz",
+    "train_labels": "train-labels-idx1-ubyte.gz",
+    "test_images": "t10k-images-idx3-ubyte.gz",
+    "test_labels": "t10k-labels-idx1-ubyte.gz",
+}
+
+
+def _download_if_missing(root: str):
+    os.makedirs(root, exist_ok=True)
+    for fname in MNIST_FILES.values():
+        path = os.path.join(root, fname)
+        if not os.path.exists(path):
+            urllib.request.urlretrieve(f"{MNIST_URL_BASE}/{fname}", path)
+
+
+def _read_idx_images(path: str) -> torch.Tensor:
+    with gzip.open(path, "rb") as f:
+        magic, n, rows, cols = struct.unpack(">IIII", f.read(16))
+        if magic != 2051:
+            raise ValueError(f"Bad image magic number: {magic}")
+        data = f.read()
+    x = torch.frombuffer(data, dtype=torch.uint8).clone().float()
+    x = x.view(n, rows, cols) / 255.0
+    return x
+
+
+def _read_idx_labels(path: str) -> torch.Tensor:
+    with gzip.open(path, "rb") as f:
+        magic, n = struct.unpack(">II", f.read(8))
+        if magic != 2049:
+            raise ValueError(f"Bad label magic number: {magic}")
+        data = f.read()
+    y = torch.frombuffer(data, dtype=torch.uint8).clone().long()
+    return y
+
+
+def load_mnist(root: str = "./data/mnist"):
+    _download_if_missing(root)
+    x_train = _read_idx_images(os.path.join(root, MNIST_FILES["train_images"]))
+    y_train = _read_idx_labels(os.path.join(root, MNIST_FILES["train_labels"]))
+    x_test = _read_idx_images(os.path.join(root, MNIST_FILES["test_images"]))
+    y_test = _read_idx_labels(os.path.join(root, MNIST_FILES["test_labels"]))
+    return x_train, y_train, x_test, y_test
 
 
 class MLPWithLUT(nn.Module):
@@ -76,17 +127,20 @@ def main():
         device = args.device
     print(f"device={device}")
 
-    tfm = transforms.ToTensor()
-    train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=tfm)
-    test_ds = datasets.MNIST(root="./data", train=False, download=True, transform=tfm)
+    x_train, y_train, x_test, y_test = load_mnist("./data/mnist")
 
     if args.train_limit > 0:
-        train_ds = Subset(train_ds, range(min(args.train_limit, len(train_ds))))
+        x_train = x_train[: args.train_limit]
+        y_train = y_train[: args.train_limit]
     if args.test_limit > 0:
-        test_ds = Subset(test_ds, range(min(args.test_limit, len(test_ds))))
+        x_test = x_test[: args.test_limit]
+        y_test = y_test[: args.test_limit]
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    train_ds = TensorDataset(x_train, y_train)
+    test_ds = TensorDataset(x_test, y_test)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = MLPWithLUT(
         hidden_dim=args.hidden,
