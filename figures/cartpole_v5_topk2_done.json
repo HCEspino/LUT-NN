@@ -1,0 +1,14 @@
+{
+  "run_name": "cartpole_v5_topk2",
+  "status": "completed",
+  "device": "cuda",
+  "algo": "dqn",
+  "episodes": 350,
+  "final_avg100": 44.91,
+  "best_reward": 205.0,
+  "solved_episode": null,
+  "summary_txt": "figures/cartpole_v5_topk2_summary.txt",
+  "metrics_csv": "figures/cartpole_v5_topk2_metrics.csv",
+  "curves_png": "figures/cartpole_v5_topk2_curves.png",
+  "finished_at": "2026-02-21T00:50:27.857302"
+}
