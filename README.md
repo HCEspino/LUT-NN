@@ -6,7 +6,7 @@ Reference C code: <https://github.com/izhikevich/SNN>
 
 ## Scope
 
-This repo implements a LUT block:
+This repo implements a paper-faithful LUT block:
 - Forward: Eq. (1)–(3)
 - Backward: Eq. (7)–(8), minimal-pair surrogate (Sec. III-A)
 
@@ -23,7 +23,7 @@ Each table tracks $n_c$ random anchor pairs $(a_{ir}, b_{ir})$.
 ### 2) Hash/index from spike-order comparisons (Eq. 1)
 
 $$
-j = H_i(x)=\operatorname{concat}(u_{i1}>0,\dots,u_{in_c}>0),\qquad u_{ir}=x_{a_{ir}}-x_{b_{ir}}
+j = H_i(x)=\mathrm{concat}(u_{i1}>0,\dots,u_{in_c}>0),\qquad u_{ir}=x_{a_{ir}}-x_{b_{ir}}
 $$
 
 `lut_nn/lut_block.py` → `_LUTTransformFn.forward`:
@@ -72,7 +72,7 @@ $$
 ### 7) Uncertainty derivative used in training (Sec. III-A)
 
 $$
-U(u)=\frac{0.5}{1+\lvert u \rvert}, \qquad U'(u)=-\frac{0.5\,\operatorname{sign}(u)}{(1+\lvert u \rvert)^2}
+U(u)=\frac{0.5}{1+\lvert u \rvert}, \qquad U'(u)=-\frac{0.5\,\mathrm{sign}(u)}{(1+\lvert u \rvert)^2}
 $$
 
 `lut_nn/lut_block.py` → `_LUTTransformFn.backward`:
