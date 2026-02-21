@@ -1,10 +1,41 @@
 import argparse
 import csv
+import ctypes
 import os
 import random
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+
+
+def _bootstrap_cuda_libs():
+    """Ensure Jetson CUDA aux libs (e.g., cuSPARSELt) are discoverable before importing torch."""
+    candidates = [
+        os.path.expanduser("~/.local/lib/python3.10/site-packages/nvidia/cusparselt/lib"),
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12.6/targets/aarch64-linux/lib",
+    ]
+    found = [p for p in candidates if os.path.isdir(p)]
+    if found:
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        parts = [p for p in current.split(":") if p]
+        for p in reversed(found):
+            if p not in parts:
+                parts.insert(0, p)
+        os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+    # Preload cuSPARSELt if present so torch import won't fail on missing linker path.
+    for p in found:
+        lib = os.path.join(p, "libcusparseLt.so.0")
+        if os.path.exists(lib):
+            try:
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+            break
+
+
+_bootstrap_cuda_libs()
 
 import gymnasium as gym
 import imageio.v2 as imageio
@@ -23,7 +54,7 @@ class Transition:
     a: int
     r: float
     ns: np.ndarray
-    d: float
+    d: float  # bootstrap terminal flag: 1 only for true terminal (not time-limit truncation)
 
 
 class ReplayBuffer:
@@ -47,20 +78,30 @@ class ReplayBuffer:
 
 
 class LUTQNet(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int, num_tables: int, num_comparisons: int, num_blocks: int):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden: int,
+        num_tables: int,
+        num_comparisons: int,
+        num_blocks: int,
+        relu_between_blocks: bool,
+    ):
         super().__init__()
         layers = [nn.Linear(state_dim, hidden), nn.ReLU()]
         for _ in range(num_blocks):
-            layers += [
+            layers.append(
                 LUTBlock(
                     in_features=hidden,
                     out_features=hidden,
                     num_tables=num_tables,
                     num_comparisons=num_comparisons,
                     residual=True,
-                ),
-                nn.ReLU(),
-            ]
+                )
+            )
+            if relu_between_blocks:
+                layers.append(nn.ReLU())
         layers += [nn.Linear(hidden, action_dim)]
         self.net = nn.Sequential(*layers)
 
@@ -100,24 +141,52 @@ def record_episode_gif(qnet, env_id, out_path, device, max_steps=500):
     return total_reward, len(frames)
 
 
+def evaluate_policy(qnet, env_id, device, episodes=10, max_steps=500, seed=0):
+    env = gym.make(env_id)
+    ep_returns = []
+    for ep in range(episodes):
+        state, _ = env.reset(seed=seed + 10000 + ep)
+        total_reward = 0.0
+        for _ in range(max_steps):
+            with torch.no_grad():
+                s = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+                action = int(qnet(s).argmax(dim=1).item())
+            nstate, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            state = nstate
+            if terminated or truncated:
+                break
+        ep_returns.append(total_reward)
+    env.close()
+    return float(np.mean(ep_returns)), float(np.std(ep_returns))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--env-id", type=str, default="CartPole-v1")
-    p.add_argument("--episodes", type=int, default=300)
+    p.add_argument("--episodes", type=int, default=500)
     p.add_argument("--max-steps", type=int, default=500)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--buffer-size", type=int, default=50000)
-    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--buffer-size", type=int, default=100000)
+    p.add_argument("--warmup-steps", type=int, default=2000)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--target-update", type=int, default=200)
+    p.add_argument("--target-update", type=int, default=1000, help="hard target copy frequency in env steps")
+    p.add_argument("--tau", type=float, default=0.0, help="polyak soft update factor; set <=0 to disable")
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--num-tables", type=int, default=8)
     p.add_argument("--num-comparisons", type=int, default=6)
     p.add_argument("--num-blocks", type=int, default=2)
     p.add_argument("--eps-start", type=float, default=1.0)
-    p.add_argument("--eps-end", type=float, default=0.05)
-    p.add_argument("--eps-decay-steps", type=int, default=20000)
+    p.add_argument("--eps-end", type=float, default=0.01)
+    p.add_argument("--eps-decay-steps", type=int, default=30000)
+    p.add_argument("--algo", type=str, default="ddqn", choices=["dqn", "ddqn"])
+    p.add_argument("--relu-between-blocks", action="store_true", help="use ReLU after each LUT block (disabled by default for paper-faithful latency ordering)")
+    p.add_argument("--compile", action="store_true", help="use torch.compile on qnet/qtarget when available")
+    p.add_argument("--train-freq", type=int, default=1, help="learn every N env steps")
+    p.add_argument("--grad-steps", type=int, default=1, help="gradient updates per learning step")
+    p.add_argument("--eval-every", type=int, default=25)
+    p.add_argument("--eval-episodes", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--run-name", type=str, default="")
@@ -132,19 +201,45 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
+    print(f"device={device} cuda_available={torch.cuda.is_available()}")
 
     os.makedirs(args.figures_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = args.run_name if args.run_name else f"cartpole_lut_dqn_{stamp}"
 
     env = gym.make(args.env_id)
+    reward_threshold = getattr(env.spec, "reward_threshold", None)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    qnet = LUTQNet(state_dim, action_dim, args.hidden, args.num_tables, args.num_comparisons, args.num_blocks).to(device)
-    qtarget = LUTQNet(state_dim, action_dim, args.hidden, args.num_tables, args.num_comparisons, args.num_blocks).to(device)
+    qnet = LUTQNet(
+        state_dim,
+        action_dim,
+        args.hidden,
+        args.num_tables,
+        args.num_comparisons,
+        args.num_blocks,
+        relu_between_blocks=args.relu_between_blocks,
+    ).to(device)
+    qtarget = LUTQNet(
+        state_dim,
+        action_dim,
+        args.hidden,
+        args.num_tables,
+        args.num_comparisons,
+        args.num_blocks,
+        relu_between_blocks=args.relu_between_blocks,
+    ).to(device)
     qtarget.load_state_dict(qnet.state_dict())
     qtarget.eval()
+
+    if args.compile and hasattr(torch, "compile"):
+        try:
+            qnet = torch.compile(qnet)
+            qtarget = torch.compile(qtarget)
+            print("torch_compile=enabled")
+        except Exception as e:
+            print(f"torch_compile=failed error={e}")
 
     opt = torch.optim.AdamW(qnet.parameters(), lr=args.lr, weight_decay=0.0)
     replay = ReplayBuffer(args.buffer_size)
@@ -159,6 +254,10 @@ def main():
     rewards = []
     avg100 = []
     losses = []
+    eval_means = []
+    eval_stds = []
+
+    solved_ep = None
 
     for ep in range(1, args.episodes + 1):
         state, _ = env.reset(seed=args.seed + ep)
@@ -171,47 +270,81 @@ def main():
 
             action = select_action(qnet, state, eps, action_dim, device)
             nstate, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
 
-            replay.push(Transition(state, action, reward, nstate, float(done)))
+            # Use terminated for TD bootstrap cutoff; time-limit truncation should still bootstrap.
+            done_for_bootstrap = float(terminated)
+            done_for_loop = terminated or truncated
+
+            replay.push(Transition(state, action, reward, nstate, done_for_bootstrap))
             state = nstate
             ep_reward += reward
 
-            if len(replay) >= args.batch_size and global_step >= args.warmup_steps:
-                s, a, r, ns, d = replay.sample(args.batch_size)
-                s = torch.tensor(s, dtype=torch.float32, device=device)
-                a = torch.tensor(a, dtype=torch.long, device=device).unsqueeze(1)
-                r = torch.tensor(r, dtype=torch.float32, device=device)
-                ns = torch.tensor(ns, dtype=torch.float32, device=device)
-                d = torch.tensor(d, dtype=torch.float32, device=device)
+            if (
+                len(replay) >= args.batch_size
+                and global_step >= args.warmup_steps
+                and (global_step % args.train_freq == 0)
+            ):
+                for _g in range(args.grad_steps):
+                    s, a, r, ns, d = replay.sample(args.batch_size)
+                    s = torch.tensor(s, dtype=torch.float32, device=device)
+                    a = torch.tensor(a, dtype=torch.long, device=device).unsqueeze(1)
+                    r = torch.tensor(r, dtype=torch.float32, device=device)
+                    ns = torch.tensor(ns, dtype=torch.float32, device=device)
+                    d = torch.tensor(d, dtype=torch.float32, device=device)
 
-                q = qnet(s).gather(1, a).squeeze(1)
-                with torch.no_grad():
-                    next_q = qtarget(ns).max(dim=1).values
-                    tgt = r + args.gamma * (1.0 - d) * next_q
+                    q = qnet(s).gather(1, a).squeeze(1)
 
-                loss = F.smooth_l1_loss(q, tgt)
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(qnet.parameters(), 1.0)
-                opt.step()
-                ep_losses.append(float(loss.item()))
+                    with torch.no_grad():
+                        if args.algo == "ddqn":
+                            next_actions = qnet(ns).argmax(dim=1, keepdim=True)
+                            next_q = qtarget(ns).gather(1, next_actions).squeeze(1)
+                        else:
+                            next_q = qtarget(ns).max(dim=1).values
+                        tgt = r + args.gamma * (1.0 - d) * next_q
 
-                if global_step % args.target_update == 0:
+                    loss = F.smooth_l1_loss(q, tgt)
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(qnet.parameters(), 1.0)
+                    opt.step()
+                    ep_losses.append(float(loss.item()))
+
+                    if args.tau > 0.0:
+                        with torch.no_grad():
+                            for p_t, p in zip(qtarget.parameters(), qnet.parameters()):
+                                p_t.data.lerp_(p.data, args.tau)
+
+                if args.target_update > 0 and global_step % args.target_update == 0:
                     qtarget.load_state_dict(qnet.state_dict())
 
-            if done:
+            if done_for_loop:
                 break
 
         rewards.append(ep_reward)
         avg100.append(float(np.mean(rewards[-100:])))
         losses.append(float(np.mean(ep_losses)) if ep_losses else np.nan)
 
-        if ep % 20 == 0 or ep == 1 or ep == args.episodes:
+        if ep % args.eval_every == 0 or ep == 1 or ep == args.episodes:
+            ev_mean, ev_std = evaluate_policy(
+                qnet,
+                args.env_id,
+                device,
+                episodes=args.eval_episodes,
+                max_steps=args.max_steps,
+                seed=args.seed,
+            )
+            eval_means.append(ev_mean)
+            eval_stds.append(ev_std)
             print(
                 f"episode={ep} reward={ep_reward:.1f} avg100={avg100[-1]:.2f} "
-                f"eps={eps:.3f} loss={losses[-1]:.4f}"
+                f"eval={ev_mean:.1f}±{ev_std:.1f} eps={eps:.3f} loss={losses[-1]:.4f}"
             )
+        else:
+            eval_means.append(np.nan)
+            eval_stds.append(np.nan)
+
+        if reward_threshold is not None and solved_ep is None and len(rewards) >= 100 and avg100[-1] >= reward_threshold:
+            solved_ep = ep
 
     env.close()
 
@@ -220,7 +353,10 @@ def main():
 
     csv_path = os.path.join(args.figures_dir, f"{run_name}_metrics.csv")
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["episode", "reward", "avg100", "loss", "epsilon"])
+        w = csv.DictWriter(
+            f,
+            fieldnames=["episode", "reward", "avg100", "loss", "epsilon", "eval_mean", "eval_std"],
+        )
         w.writeheader()
         for i in range(len(rewards)):
             w.writerow(
@@ -230,14 +366,17 @@ def main():
                     "avg100": avg100[i],
                     "loss": losses[i],
                     "epsilon": max(args.eps_end, args.eps_start - eps_decay * (i + 1)),
+                    "eval_mean": eval_means[i],
+                    "eval_std": eval_stds[i],
                 }
             )
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
     ep_x = np.arange(1, len(rewards) + 1)
 
-    axes[0].plot(ep_x, rewards, alpha=0.6, label="episode reward")
+    axes[0].plot(ep_x, rewards, alpha=0.45, label="episode reward")
     axes[0].plot(ep_x, avg100, linewidth=2, label="avg100")
+    axes[0].axhline(reward_threshold if reward_threshold is not None else 475.0, linestyle="--", alpha=0.7, label="solve threshold")
     axes[0].set_title("Reward")
     axes[0].set_xlabel("Episode")
     axes[0].set_ylabel("Return")
@@ -254,8 +393,9 @@ def main():
     axes[2].set_xlabel("Episode")
     axes[2].set_ylabel("epsilon")
 
+    solved_txt = f"solved_ep={solved_ep}" if solved_ep is not None else "solved_ep=not_reached"
     fig.suptitle(
-        f"{run_name} | first_reward={first_reward:.1f} last_reward={last_reward:.1f} avg100_final={avg100[-1]:.2f}"
+        f"{run_name} | algo={args.algo} first={first_reward:.1f} last={last_reward:.1f} avg100={avg100[-1]:.2f} {solved_txt}"
     )
     fig.tight_layout()
     plot_path = os.path.join(args.figures_dir, f"{run_name}_curves.png")
@@ -266,11 +406,16 @@ def main():
     with open(summary_path, "w") as f:
         f.write(f"run_name={run_name}\n")
         f.write(f"env={args.env_id}\n")
+        f.write(f"algo={args.algo}\n")
+        f.write(f"relu_between_blocks={args.relu_between_blocks}\n")
+        f.write(f"compile={args.compile}\n")
         f.write(f"episodes={args.episodes}\n")
         f.write(f"first_reward={first_reward}\n")
         f.write(f"last_reward={last_reward}\n")
         f.write(f"final_avg100={avg100[-1]:.4f}\n")
         f.write(f"best_reward={max(rewards):.1f}\n")
+        f.write(f"reward_threshold={reward_threshold}\n")
+        f.write(f"solved_episode={solved_ep}\n")
         f.write(f"first_gif={first_gif}\n")
         f.write(f"last_gif={last_gif}\n")
         f.write(f"metrics_csv={csv_path}\n")

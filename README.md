@@ -101,3 +101,36 @@ PYTHONPATH=. python3 scripts/mnist_lut_mlp.py \
   --num-tables 4 \
   --num-comparisons 4
 ```
+
+## GPU troubleshooting (Jetson / cuSPARSELt)
+
+If `import torch` fails with:
+
+`ImportError: libcusparseLt.so.0: cannot open shared object file`
+
+Root cause: PyTorch can be installed, but the dynamic linker cannot find cuSPARSELt at runtime.
+
+### What this repo now does
+
+Both training scripts (`scripts/mnist_lut_mlp.py` and `scripts/cartpole_lut_dqn.py`) now:
+1. Prepend common CUDA/Jetson library paths to `LD_LIBRARY_PATH`
+2. Preload `libcusparseLt.so.0` (when present) before importing `torch`
+
+This avoids per-shell manual exports in typical local runs.
+
+### One-liner fallback (manual)
+
+If needed, run with:
+
+```bash
+LD_LIBRARY_PATH=$HOME/.local/lib/python3.10/site-packages/nvidia/cusparselt/lib:$LD_LIBRARY_PATH \
+PYTHONPATH=. python3 scripts/cartpole_lut_dqn.py --episodes 1
+```
+
+### Verify GPU is active
+
+`cartpole_lut_dqn.py` prints:
+
+`device=cuda cuda_available=True`
+
+at startup when GPU is correctly configured.

@@ -1,10 +1,40 @@
 import argparse
 import csv
+import ctypes
 import gzip
 import os
 import struct
 import urllib.request
 from datetime import datetime
+
+
+def _bootstrap_cuda_libs():
+    """Ensure Jetson CUDA aux libs (e.g., cuSPARSELt) are discoverable before importing torch."""
+    candidates = [
+        os.path.expanduser("~/.local/lib/python3.10/site-packages/nvidia/cusparselt/lib"),
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12.6/targets/aarch64-linux/lib",
+    ]
+    found = [p for p in candidates if os.path.isdir(p)]
+    if found:
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        parts = [p for p in current.split(":") if p]
+        for p in reversed(found):
+            if p not in parts:
+                parts.insert(0, p)
+        os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+    for p in found:
+        lib = os.path.join(p, "libcusparseLt.so.0")
+        if os.path.exists(lib):
+            try:
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+            break
+
+
+_bootstrap_cuda_libs()
 
 import matplotlib.pyplot as plt
 import torch

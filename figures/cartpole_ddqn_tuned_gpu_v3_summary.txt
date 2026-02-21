@@ -1,0 +1,16 @@
+run_name=cartpole_ddqn_tuned_gpu_v3
+env=CartPole-v1
+algo=ddqn
+relu_between_blocks=True
+compile=False
+episodes=350
+first_reward=8.0
+last_reward=351.0
+final_avg100=27.8100
+best_reward=127.0
+reward_threshold=475.0
+solved_episode=None
+first_gif=figures/cartpole_ddqn_tuned_gpu_v3_first_session.gif
+last_gif=figures/cartpole_ddqn_tuned_gpu_v3_last_session.gif
+metrics_csv=figures/cartpole_ddqn_tuned_gpu_v3_metrics.csv
+curves_png=figures/cartpole_ddqn_tuned_gpu_v3_curves.png
