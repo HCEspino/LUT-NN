@@ -78,6 +78,51 @@ class ReplayBuffer:
         return len(self.buf)
 
 
+
+
+class RunningNorm:
+    def __init__(self, shape, eps: float = 1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps
+
+    def update(self, x: np.ndarray):
+        x = np.asarray(x, dtype=np.float64)
+        if x.ndim == 1:
+            x = x[None, :]
+        batch_mean = x.mean(axis=0)
+        batch_var = x.var(axis=0)
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = m2 / tot_count
+
+        self.mean = new_mean
+        self.var = np.maximum(new_var, 1e-12)
+        self.count = tot_count
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        return ((x - self.mean) / np.sqrt(self.var + 1e-8)).astype(np.float32)
+
+
+def _lr_scale(step: int, warmup_steps: int, total_steps: int, min_factor: float) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        return max(1e-6, float(step + 1) / float(warmup_steps))
+    if total_steps <= warmup_steps:
+        return 1.0
+    t = (step - warmup_steps) / max(1, (total_steps - warmup_steps))
+    t = float(np.clip(t, 0.0, 1.0))
+    cosine = 0.5 * (1.0 + np.cos(np.pi * t))
+    return float(min_factor + (1.0 - min_factor) * cosine)
+
+
 class LUTQNet(nn.Module):
     def __init__(
         self,
@@ -123,9 +168,11 @@ def select_action(qnet, state, eps, action_dim, device):
         return int(q.argmax(dim=1).item())
 
 
-def record_episode_gif(qnet, env_id, out_path, device, max_steps=500):
+def record_episode_gif(qnet, env_id, out_path, device, obs_norm: RunningNorm | None = None, max_steps=500):
     env = gym.make(env_id, render_mode="rgb_array")
     state, _ = env.reset()
+    if obs_norm is not None:
+        state = obs_norm.normalize(state)
     frames = []
     total_reward = 0.0
     for _ in range(max_steps):
@@ -136,7 +183,7 @@ def record_episode_gif(qnet, env_id, out_path, device, max_steps=500):
             action = int(qnet(s).argmax(dim=1).item())
         nstate, reward, terminated, truncated, _ = env.step(action)
         total_reward += reward
-        state = nstate
+        state = obs_norm.normalize(nstate) if obs_norm is not None else nstate
         if terminated or truncated:
             frame = env.render()
             frames.append(frame)
@@ -146,19 +193,21 @@ def record_episode_gif(qnet, env_id, out_path, device, max_steps=500):
     return total_reward, len(frames)
 
 
-def evaluate_policy(qnet, env_id, device, episodes=10, max_steps=500, seed=0):
+def evaluate_policy(qnet, env_id, device, obs_norm: RunningNorm | None = None, episodes=10, max_steps=500, seed=0):
     env = gym.make(env_id)
     ep_returns = []
     for ep in range(episodes):
         state, _ = env.reset(seed=seed + 10000 + ep)
+        if obs_norm is not None:
+            state = obs_norm.normalize(state)
         total_reward = 0.0
         for _ in range(max_steps):
             with torch.no_grad():
                 s = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
                 action = int(qnet(s).argmax(dim=1).item())
-            nstate, reward, terminated, truncated, _ = env.step(action)
+            nstate_raw, reward, terminated, truncated, _ = env.step(action)
             total_reward += reward
-            state = nstate
+            state = obs_norm.normalize(nstate_raw) if obs_norm is not None else nstate_raw
             if terminated or truncated:
                 break
         ep_returns.append(total_reward)
@@ -184,7 +233,7 @@ def main():
     p.add_argument("--num-blocks", type=int, default=2)
     p.add_argument("--eps-start", type=float, default=1.0)
     p.add_argument("--eps-end", type=float, default=0.01)
-    p.add_argument("--eps-decay-steps", type=int, default=15000)
+    p.add_argument("--eps-decay-steps", type=int, default=4000)
     p.add_argument("--algo", type=str, default="dqn", choices=["dqn", "ddqn"])
     p.add_argument("--inter-block-norm", type=str, default="layernorm", choices=["none", "relu", "layernorm"], help="transform between LUT blocks; layernorm is recommended for LUT hash stability")
     p.add_argument("--surrogate-topk", type=int, default=1, help="number of closest comparison pairs per table to use in surrogate backward")
@@ -197,8 +246,16 @@ def main():
     p.add_argument("--device", type=str, default="cuda", choices=["auto", "cpu", "cuda"])
     p.add_argument("--run-name", type=str, default="")
     p.add_argument("--table-lr-mult", type=float, default=3.0, help="learning-rate multiplier for LUT table parameters")
+    p.add_argument("--lr-warmup-steps", type=int, default=1000, help="linear LR warmup steps")
+    p.add_argument("--lr-min-factor", type=float, default=0.1, help="minimum LR factor after cosine decay")
+    p.add_argument("--base-optim", type=str, default="adamw", choices=["adamw", "sgd"])
+    p.add_argument("--table-optim", type=str, default="sgd", choices=["adamw", "sgd"])
+    p.add_argument("--table-momentum", type=float, default=0.0, help="momentum for table SGD (recommend 0.0)")
+    p.add_argument("--obs-norm", dest="obs_norm", action="store_true", help="enable running observation normalization")
+    p.add_argument("--no-obs-norm", dest="obs_norm", action="store_false", help="disable observation normalization")
     p.add_argument("--grad-clip", type=float, default=5.0, help="global grad clip norm")
     p.add_argument("--figures-dir", type=str, default="figures")
+    p.set_defaults(obs_norm=True)
     p.add_argument("--done-file", type=str, default="", help="optional path to write completion JSON status")
     args = p.parse_args()
 
@@ -264,20 +321,32 @@ def main():
         else:
             base_params.append(param)
 
-    opt = torch.optim.AdamW(
-        [
-            {"params": base_params, "lr": args.lr},
-            {"params": table_params, "lr": args.lr * args.table_lr_mult},
-        ],
-        weight_decay=0.0,
-    )
-    print(f"optimizer=AdamW base_lr={args.lr:.2e} table_lr={args.lr * args.table_lr_mult:.2e} table_params={len(table_params)}")
+    base_lr = args.lr
+    table_lr = args.lr * args.table_lr_mult
+
+    if args.base_optim == "adamw":
+        opt_base = torch.optim.AdamW(base_params, lr=base_lr, weight_decay=0.0) if base_params else None
+    else:
+        opt_base = torch.optim.SGD(base_params, lr=base_lr, momentum=0.9) if base_params else None
+
+    if args.table_optim == "sgd":
+        opt_table = torch.optim.SGD(table_params, lr=table_lr, momentum=args.table_momentum) if table_params else None
+    else:
+        opt_table = torch.optim.AdamW(table_params, lr=table_lr, weight_decay=0.0) if table_params else None
+
+    print(f"optimizer base={args.base_optim} table={args.table_optim} base_lr={base_lr:.2e} table_lr={table_lr:.2e} table_params={len(table_params)}")
+
+    if args.tau > 0.0 and args.target_update > 0:
+        print(f"target_update_conflict: tau={args.tau} > 0 so disabling hard target updates (target_update={args.target_update})")
+
     replay = ReplayBuffer(args.buffer_size)
+    obs_norm = RunningNorm((state_dim,)) if args.obs_norm else None
 
     first_gif = os.path.join(args.figures_dir, f"{run_name}_first_session.gif")
-    first_reward, first_frames = record_episode_gif(qnet, args.env_id, first_gif, device, args.max_steps)
+    first_reward, first_frames = record_episode_gif(qnet, args.env_id, first_gif, device, obs_norm=obs_norm, max_steps=args.max_steps)
 
     global_step = 0
+    total_sched_steps = args.episodes * args.max_steps
     eps = args.eps_start
     eps_decay = (args.eps_start - args.eps_end) / max(args.eps_decay_steps, 1)
 
@@ -290,7 +359,12 @@ def main():
     solved_ep = None
 
     for ep in range(1, args.episodes + 1):
-        state, _ = env.reset(seed=args.seed + ep)
+        state_raw, _ = env.reset(seed=args.seed + ep)
+        if obs_norm is not None:
+            obs_norm.update(state_raw)
+            state = obs_norm.normalize(state_raw)
+        else:
+            state = state_raw
         ep_reward = 0.0
         ep_losses = []
 
@@ -299,11 +373,17 @@ def main():
             eps = max(args.eps_end, args.eps_start - eps_decay * global_step)
 
             action = select_action(qnet, state, eps, action_dim, device)
-            nstate, reward, terminated, truncated, _ = env.step(action)
+            nstate_raw, reward, terminated, truncated, _ = env.step(action)
 
             # Use terminated for TD bootstrap cutoff; time-limit truncation should still bootstrap.
             done_for_bootstrap = float(terminated)
             done_for_loop = terminated or truncated
+
+            if obs_norm is not None:
+                obs_norm.update(nstate_raw)
+                nstate = obs_norm.normalize(nstate_raw)
+            else:
+                nstate = nstate_raw
 
             replay.push(Transition(state, action, reward, nstate, done_for_bootstrap))
             state = nstate
@@ -333,10 +413,23 @@ def main():
                         tgt = r + args.gamma * (1.0 - d) * next_q
 
                     loss = F.smooth_l1_loss(q, tgt)
-                    opt.zero_grad(set_to_none=True)
+                    if opt_base is not None:
+                        opt_base.zero_grad(set_to_none=True)
+                    if opt_table is not None:
+                        opt_table.zero_grad(set_to_none=True)
+
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(qnet.parameters(), args.grad_clip)
-                    opt.step()
+
+                    lr_scale = _lr_scale(global_step, args.lr_warmup_steps, total_sched_steps, args.lr_min_factor)
+                    if opt_base is not None:
+                        for pg in opt_base.param_groups:
+                            pg["lr"] = base_lr * lr_scale
+                        opt_base.step()
+                    if opt_table is not None:
+                        for pg in opt_table.param_groups:
+                            pg["lr"] = table_lr * lr_scale
+                        opt_table.step()
                     ep_losses.append(float(loss.item()))
 
                     if args.tau > 0.0:
@@ -344,7 +437,7 @@ def main():
                             for p_t, p in zip(qtarget.parameters(), qnet.parameters()):
                                 p_t.data.lerp_(p.data, args.tau)
 
-                if args.target_update > 0 and global_step % args.target_update == 0:
+                if args.tau <= 0.0 and args.target_update > 0 and global_step % args.target_update == 0:
                     qtarget.load_state_dict(qnet.state_dict())
 
             if done_for_loop:
@@ -359,6 +452,7 @@ def main():
                 qnet,
                 args.env_id,
                 device,
+                obs_norm=obs_norm,
                 episodes=args.eval_episodes,
                 max_steps=args.max_steps,
                 seed=args.seed,
@@ -379,7 +473,7 @@ def main():
     env.close()
 
     last_gif = os.path.join(args.figures_dir, f"{run_name}_last_session.gif")
-    last_reward, last_frames = record_episode_gif(qnet, args.env_id, last_gif, device, args.max_steps)
+    last_reward, last_frames = record_episode_gif(qnet, args.env_id, last_gif, device, obs_norm=obs_norm, max_steps=args.max_steps)
 
     csv_path = os.path.join(args.figures_dir, f"{run_name}_metrics.csv")
     with open(csv_path, "w", newline="") as f:
@@ -440,6 +534,12 @@ def main():
         f.write(f"inter_block_norm={args.inter_block_norm}\n")
         f.write(f"surrogate_topk={args.surrogate_topk}\n")
         f.write(f"table_lr_mult={args.table_lr_mult}\n")
+        f.write(f"base_optim={args.base_optim}\n")
+        f.write(f"table_optim={args.table_optim}\n")
+        f.write(f"table_momentum={args.table_momentum}\n")
+        f.write(f"lr_warmup_steps={args.lr_warmup_steps}\n")
+        f.write(f"lr_min_factor={args.lr_min_factor}\n")
+        f.write(f"obs_norm={args.obs_norm}\n")
         f.write(f"grad_clip={args.grad_clip}\n")
         f.write(f"compile={args.compile}\n")
         f.write(f"episodes={args.episodes}\n")
@@ -463,6 +563,9 @@ def main():
         "episodes": args.episodes,
         "final_avg100": float(avg100[-1]) if avg100 else None,
         "best_reward": float(max(rewards)) if rewards else None,
+        "base_optim": args.base_optim,
+        "table_optim": args.table_optim,
+        "obs_norm": args.obs_norm,
         "solved_episode": solved_ep,
         "summary_txt": summary_path,
         "metrics_csv": csv_path,
