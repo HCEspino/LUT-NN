@@ -1,0 +1,17 @@
+{
+  "run_name": "cartpole_v6_topk2_h192_t8_c8_e500",
+  "status": "completed",
+  "device": "cuda",
+  "algo": "dqn",
+  "episodes": 500,
+  "final_avg100": 212.57,
+  "best_reward": 500.0,
+  "base_optim": "adamw",
+  "table_optim": "sgd",
+  "obs_norm": true,
+  "solved_episode": null,
+  "summary_txt": "figures/cartpole_v6_topk2_h192_t8_c8_e500_summary.txt",
+  "metrics_csv": "figures/cartpole_v6_topk2_h192_t8_c8_e500_metrics.csv",
+  "curves_png": "figures/cartpole_v6_topk2_h192_t8_c8_e500_curves.png",
+  "finished_at": "2026-02-22T08:17:27.675151"
+}
