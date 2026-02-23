@@ -4,7 +4,7 @@
   "device": "cuda",
   "algo": "ppo",
   "total_steps": 200000,
-  "final_avg100": 189.2,
+  "final_avg100": 490.1,
   "best_reward": 500.0,
   "solved_update": 88,
   "summary_txt": "figures/cartpole_lut_ppo_h192_t8_c8_topk2_200k_tmux_summary.txt",
